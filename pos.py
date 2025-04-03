@@ -6,6 +6,10 @@ import random
 import string
 from PIL import Image, ImageTk
 from ttkthemes import ThemedTk
+import cv2
+from pyzbar.pyzbar import decode
+import threading
+import time
 import os
 
 class ProductInventorySystem:
@@ -15,21 +19,9 @@ class ProductInventorySystem:
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
         
-        # Tentukan path database
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.db_path = os.path.join(current_dir, 'inventory.db')
-        
         # Koneksi ke database SQLite
-        try:
-            self.conn = sqlite3.connect(self.db_path)
-            print(f"Database terbuat di: {self.db_path}")
-            self.create_tables()
-        except sqlite3.Error as e:
-            messagebox.showerror("Database Error", f"Gagal membuat database: {str(e)}")
-            return
-
-        # Buat folder yang diperlukan
-        self.create_required_folders()
+        self.conn = sqlite3.connect('inventory.db')
+        self.create_tables()
         
         # Buat notebook untuk tab berbeda
         self.notebook = ttk.Notebook(root)
@@ -44,9 +36,6 @@ class ProductInventorySystem:
         self.notebook.add(self.inventory_frame, text="Manajemen Inventaris")
         self.notebook.add(self.pos_frame, text="Point of Sale")
         self.notebook.add(self.reports_frame, text="Laporan")
-        
-        # Buat menu
-        self.create_menu()
         
         # Setup tab inventaris
         self.setup_inventory_tab()
@@ -63,39 +52,6 @@ class ProductInventorySystem:
         # Cek item inventaris yang rendah
         self.check_low_inventory()
 
-    def create_required_folders(self):
-        folders = ['struk', 'laporan', 'backup']
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        for folder in folders:
-            folder_path = os.path.join(current_dir, folder)
-            if not os.path.exists(folder_path):
-                os.makedirs(folder_path)
-                print(f"Folder {folder} dibuat di: {folder_path}")
-
-    def create_menu(self):
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
-        
-        # Menu File
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Backup Database", command=self.backup_database)
-        file_menu.add_separator()
-        file_menu.add_command(label="Keluar", command=self.on_closing)
-        
-        # Menu Laporan
-        report_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Laporan", menu=report_menu)
-        report_menu.add_command(label="Penjualan Harian", 
-                              command=lambda: self.generate_report_by_type("Penjualan Harian"))
-        report_menu.add_command(label="Penjualan Produk", 
-                              command=lambda: self.generate_report_by_type("Penjualan Produk"))
-        report_menu.add_command(label="Pergerakan Inventaris", 
-                              command=lambda: self.generate_report_by_type("Pergerakan Inventaris"))
-        report_menu.add_command(label="Stok Rendah", 
-                              command=lambda: self.generate_report_by_type("Stok Rendah"))
-        
     def create_tables(self):
         cursor = self.conn.cursor()
         cursor.execute('''
@@ -155,8 +111,7 @@ class ProductInventorySystem:
         )
         ''')
         
-        self.conn.commit()
-
+        self.conn.commit()    
     def setup_inventory_tab(self):
         # Variabel untuk inventaris
         self.barcode_var = tk.StringVar()
@@ -166,6 +121,8 @@ class ProductInventorySystem:
         self.quantity_var = tk.StringVar()
         self.low_stock_threshold_var = tk.StringVar()
         self.search_var = tk.StringVar()
+        self.camera_active = False
+        self.camera_thread = None
         self.edit_mode = False
         self.edit_id = None
         
@@ -186,8 +143,10 @@ class ProductInventorySystem:
         self.barcode_entry = ttk.Entry(left_frame, textvariable=self.barcode_var, width=30)
         self.barcode_entry.grid(row=0, column=1, padx=10, pady=5, sticky=tk.W)
         
-        ttk.Button(left_frame, text="Generate Barcode", command=self.generate_barcode).grid(row=0, column=2, padx=10, pady=5)
+        ttk.Button(left_frame, text="Scan Barcode", command=self.toggle_camera).grid(row=0, column=2, padx=10, pady=5)
+        ttk.Button(left_frame, text="Generate Otomatis", command=self.generate_barcode).grid(row=0, column=3, padx=10, pady=5)
         
+       
         ttk.Label(left_frame, text="Nama Produk:").grid(row=2, column=0, padx=10, pady=5, sticky=tk.W)
         ttk.Entry(left_frame, textvariable=self.product_name_var, width=50).grid(row=2, column=1, columnspan=3, padx=10, pady=5, sticky=tk.W)
         
@@ -208,8 +167,9 @@ class ProductInventorySystem:
         ttk.Label(left_frame, text="(Peringatan jika ≤ nilai ini)").grid(row=6, column=2, columnspan=2, padx=10, pady=5, sticky=tk.W)
         
         # Set nilai default untuk batas stok rendah
-        self.low_stock_threshold_var.set("3")     
-                # Frame Tombol
+        self.low_stock_threshold_var.set("3")
+        
+        # Frame Tombol
         btn_frame = ttk.Frame(left_frame)
         btn_frame.grid(row=7, column=0, columnspan=4, padx=10, pady=15)
         
@@ -220,55 +180,68 @@ class ProductInventorySystem:
         
         # Setup frame pencarian dan daftar produk
         self.setup_product_list_frame(right_frame)
-
-    def setup_product_list_frame(self, parent):
-        # Frame untuk pencarian
-        search_frame = ttk.LabelFrame(parent, text="Pencarian Produk", padding=10)
+    def setup_product_list_frame(self, right_frame):
+        # Frame Pencarian
+        search_frame = ttk.Frame(right_frame)
         search_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Search box dan tombol
-        ttk.Label(search_frame, text="Cari:").pack(side=tk.LEFT)
-        ttk.Entry(search_frame, textvariable=self.search_var).pack(side=tk.LEFT, padx=5)  # Perbaikan disini: entry -> Entry
-        ttk.Button(search_frame, text="Cari", command=self.search_products).pack(side=tk.LEFT)
+        ttk.Label(search_frame, text="Cari:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(search_frame, textvariable=self.search_var, width=30).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Cari", command=self.search_products).pack(side=tk.LEFT, padx=5)
         ttk.Button(search_frame, text="Tampilkan Semua", command=self.display_products).pack(side=tk.LEFT, padx=5)
-        ttk.Button(search_frame, text="Stok Rendah", command=self.display_low_stock).pack(side=tk.LEFT)
+        ttk.Button(search_frame, text="Stok Rendah", command=self.display_low_stock).pack(side=tk.LEFT, padx=5)
+
+        # Treeview untuk Produk
+        self.tree_frame = ttk.Frame(right_frame)
+        self.tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Frame untuk tabel produk
-        table_frame = ttk.Frame(parent)
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.tree_scroll_y = ttk.Scrollbar(self.tree_frame)
+        self.tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(table_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree_scroll_x = ttk.Scrollbar(self.tree_frame, orient="horizontal")
+        self.tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         
-        # Treeview untuk menampilkan produk
-        self.product_tree = ttk.Treeview(
-            table_frame,
-            columns=('ID', 'Nama', 'Barcode', 'Harga', 'Stok', 'Updated'),
-            show='headings',
-            yscrollcommand=scrollbar.set
-        )
+        self.product_tree = ttk.Treeview(self.tree_frame,
+                                        columns=("id", "barcode", "name", "capital_price", "selling_price",
+                                                "quantity", "low_stock", "status", "date_added", "last_updated"),
+                                        show="headings",
+                                        yscrollcommand=self.tree_scroll_y.set,
+                                        xscrollcommand=self.tree_scroll_x.set)
         
-        # Konfigurasi scrollbar
-        scrollbar.config(command=self.product_tree.yview)
+        self.tree_scroll_y.config(command=self.product_tree.yview)
+        self.tree_scroll_x.config(command=self.product_tree.xview)
         
-        # Konfigurasi kolom
-        self.product_tree.heading('ID', text='ID')
-        self.product_tree.heading('Nama', text='Nama Produk')
-        self.product_tree.heading('Barcode', text='Barcode')
-        self.product_tree.heading('Harga', text='Harga')
-        self.product_tree.heading('Stok', text='Stok')
-        self.product_tree.heading('Updated', text='Terakhir Diupdate')
+        # Definisi kolom
+        self.product_tree.heading("id", text="ID")
+        self.product_tree.heading("barcode", text="Barcode")
+        self.product_tree.heading("name", text="Nama Produk")
+        self.product_tree.heading("capital_price", text="Harga Modal")
+        self.product_tree.heading("selling_price", text="Harga Jual")
+        self.product_tree.heading("quantity", text="Stok")
+        self.product_tree.heading("low_stock", text="Batas Stok")
+        self.product_tree.heading("status", text="Status")
+        self.product_tree.heading("date_added", text="Tanggal Ditambahkan")
+        self.product_tree.heading("last_updated", text="Terakhir Diupdate")
         
-        # Atur lebar kolom
-        self.product_tree.column('ID', width=50)
-        self.product_tree.column('Nama', width=200)
-        self.product_tree.column('Barcode', width=100)
-        self.product_tree.column('Harga', width=100)
-        self.product_tree.column('Stok', width=70)
-        self.product_tree.column('Updated', width=150)
+        # Konfigurasi lebar kolom
+        self.product_tree.column("id", width=50)
+        self.product_tree.column("barcode", width=120)
+        self.product_tree.column("name", width=200)
+        self.product_tree.column("capital_price", width=100)
+        self.product_tree.column("selling_price", width=100)
+        self.product_tree.column("quantity", width=80)
+        self.product_tree.column("low_stock", width=80)
+        self.product_tree.column("status", width=80)
+        self.product_tree.column("date_added", width=150)
+        self.product_tree.column("last_updated", width=150)
         
         self.product_tree.pack(fill=tk.BOTH, expand=True)
+        
+        # Bind treeview selection
+        self.product_tree.bind("<ButtonRelease-1>", self.get_selected_product)
+        
+        # Create tags for status highlighting
+        self.product_tree.tag_configure('low_stock', background='#FFCCCC')
 
     def setup_pos_tab(self):
         # Variabel POS
@@ -291,52 +264,38 @@ class ProductInventorySystem:
         
         # Frame kanan untuk pembayaran dan total
         pos_right_frame = ttk.Frame(pos_main_frame)
-        pos_right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5, ipadx=10) 
-                # Frame Input Produk
-        entry_frame = ttk.LabelFrame(pos_left_frame, text="Input Produk")
+        pos_right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5, ipadx=10)
+        
+        # Setup frame input produk
+        self.setup_product_entry_frame(pos_left_frame)
+        
+        # Setup frame keranjang
+        self.setup_cart_frame(pos_left_frame)
+        
+        # Setup frame pembayaran
+        self.setup_payment_frame(pos_right_frame)
+    def setup_product_entry_frame(self, parent_frame):
+        entry_frame = ttk.LabelFrame(parent_frame, text="Input Produk")
         entry_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Input barcode atau keyword
-        ttk.Label(entry_frame, text="Barcode/Keyword:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.pos_search_var = tk.StringVar()
-        search_entry = ttk.Entry(entry_frame, textvariable=self.pos_search_var, width=30)
-        search_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
-        search_entry.bind("<Return>", lambda e: self.search_product_pos())
+        ttk.Label(entry_frame, text="Barcode:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        barcode_entry = ttk.Entry(entry_frame, textvariable=self.pos_barcode_var, width=20)
+        barcode_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        barcode_entry.bind("<Return>", lambda event: self.add_to_cart())
         
-        ttk.Button(entry_frame, text="Cari", command=self.search_product_pos).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(entry_frame, text="Scan", command=self.pos_scan_barcode).grid(row=0, column=2, padx=5, pady=5)
         
         ttk.Label(entry_frame, text="Jumlah:").grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
         ttk.Entry(entry_frame, textvariable=self.pos_qty_var, width=5).grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
         
         ttk.Button(entry_frame, text="Tambah ke Keranjang", command=self.add_to_cart).grid(row=0, column=5, padx=5, pady=5)
-
-        # Frame hasil pencarian
-        self.search_result_frame = ttk.LabelFrame(entry_frame, text="Hasil Pencarian")
-        self.search_result_frame.grid(row=1, column=0, columnspan=6, padx=5, pady=5, sticky='nsew')
-
-        # Treeview untuk hasil pencarian
-        self.search_tree = ttk.Treeview(self.search_result_frame,
-                                      columns=("id", "barcode", "name", "price", "stock"),
-                                      show="headings",
-                                      height=4)
         
-        self.search_tree.heading("id", text="ID")
-        self.search_tree.heading("barcode", text="Barcode")
-        self.search_tree.heading("name", text="Nama Produk")
-        self.search_tree.heading("price", text="Harga")
-        self.search_tree.heading("stock", text="Stok")
-        
-        self.search_tree.column("id", width=50)
-        self.search_tree.column("barcode", width=100)
-        self.search_tree.column("name", width=200)
-        self.search_tree.column("price", width=100)
-        self.search_tree.column("stock", width=70)
-        
-        self.search_tree.pack(fill=tk.BOTH, expand=True)
-        self.search_tree.bind("<Double-1>", self.select_search_result)
+        # Label kamera untuk POS scanning
+        self.pos_camera_label = ttk.Label(entry_frame)
+        self.pos_camera_label.grid(row=1, column=0, columnspan=6, padx=5, pady=5)
 
-        # Frame Keranjang Belanja
-        cart_frame = ttk.LabelFrame(pos_left_frame, text="Keranjang Belanja")
+    def setup_cart_frame(self, parent_frame):
+        cart_frame = ttk.LabelFrame(parent_frame, text="Keranjang Belanja")
         cart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         # Treeview keranjang
@@ -369,7 +328,7 @@ class ProductInventorySystem:
         # Konfigurasi lebar kolom
         self.cart_tree.column("id", width=50)
         self.cart_tree.column("barcode", width=100)
-        self.cart_tree.column("name", width=200)
+        self.cart_tree.column("name", width=250)
         self.cart_tree.column("price", width=100)
         self.cart_tree.column("qty", width=60)
         self.cart_tree.column("total", width=100)
@@ -383,8 +342,8 @@ class ProductInventorySystem:
         ttk.Button(cart_btn_frame, text="Hapus Item", command=self.remove_from_cart).pack(side=tk.LEFT, padx=5)
         ttk.Button(cart_btn_frame, text="Kosongkan Keranjang", command=self.clear_cart).pack(side=tk.LEFT, padx=5)
 
-        # Frame Pembayaran
-        payment_frame = ttk.LabelFrame(pos_right_frame, text="Pembayaran")
+    def setup_payment_frame(self, parent_frame):
+        payment_frame = ttk.LabelFrame(parent_frame, text="Pembayaran")
         payment_frame.pack(fill=tk.BOTH, expand=False, padx=5, pady=5)
         
         # Tampilan subtotal, pajak, total
@@ -395,14 +354,99 @@ class ProductInventorySystem:
         ttk.Label(payment_frame, text="PPN (11%):").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
         self.tax_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 12))
         self.tax_label.grid(row=1, column=1, padx=5, pady=5, sticky=tk.E)
-
+        
         ttk.Separator(payment_frame, orient='horizontal').grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         
         ttk.Label(payment_frame, text="TOTAL:", font=("Arial", 12, "bold")).grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
         self.total_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 14, "bold"))
         self.total_label.grid(row=3, column=1, padx=5, pady=5, sticky=tk.E)
+    def setup_product_entry_frame(self, parent_frame):
+        entry_frame = ttk.LabelFrame(parent_frame, text="Input Produk")
+        entry_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Metode pembayaran
+        ttk.Label(entry_frame, text="Barcode:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        barcode_entry = ttk.Entry(entry_frame, textvariable=self.pos_barcode_var, width=20)
+        barcode_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        barcode_entry.bind("<Return>", lambda event: self.add_to_cart())
+        
+        ttk.Button(entry_frame, text="Scan", command=self.pos_scan_barcode).grid(row=0, column=2, padx=5, pady=5)
+        
+        ttk.Label(entry_frame, text="Jumlah:").grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
+        ttk.Entry(entry_frame, textvariable=self.pos_qty_var, width=5).grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
+        
+        ttk.Button(entry_frame, text="Tambah ke Keranjang", command=self.add_to_cart).grid(row=0, column=5, padx=5, pady=5)
+        
+        # Label kamera untuk POS scanning
+        self.pos_camera_label = ttk.Label(entry_frame)
+        self.pos_camera_label.grid(row=1, column=0, columnspan=6, padx=5, pady=5)
+
+    def setup_cart_frame(self, parent_frame):
+        cart_frame = ttk.LabelFrame(parent_frame, text="Keranjang Belanja")
+        cart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Treeview keranjang
+        cart_tree_frame = ttk.Frame(cart_frame)
+        cart_tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        cart_scroll_y = ttk.Scrollbar(cart_tree_frame)
+        cart_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        cart_scroll_x = ttk.Scrollbar(cart_tree_frame, orient="horizontal")
+        cart_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.cart_tree = ttk.Treeview(cart_tree_frame,
+                                     columns=("id", "barcode", "name", "price", "qty", "total"),
+                                     show="headings",
+                                     yscrollcommand=cart_scroll_y.set,
+                                     xscrollcommand=cart_scroll_x.set)
+        
+        cart_scroll_y.config(command=self.cart_tree.yview)
+        cart_scroll_x.config(command=self.cart_tree.xview)
+        
+        # Definisi kolom keranjang
+        self.cart_tree.heading("id", text="ID")
+        self.cart_tree.heading("barcode", text="Barcode")
+        self.cart_tree.heading("name", text="Produk")
+        self.cart_tree.heading("price", text="Harga Satuan")
+        self.cart_tree.heading("qty", text="Jumlah")
+        self.cart_tree.heading("total", text="Total")
+        
+        # Konfigurasi lebar kolom
+        self.cart_tree.column("id", width=50)
+        self.cart_tree.column("barcode", width=100)
+        self.cart_tree.column("name", width=250)
+        self.cart_tree.column("price", width=100)
+        self.cart_tree.column("qty", width=60)
+        self.cart_tree.column("total", width=100)
+        
+        self.cart_tree.pack(fill=tk.BOTH, expand=True)
+        
+        # Tombol keranjang
+        cart_btn_frame = ttk.Frame(cart_frame)
+        cart_btn_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Button(cart_btn_frame, text="Hapus Item", command=self.remove_from_cart).pack(side=tk.LEFT, padx=5)
+        ttk.Button(cart_btn_frame, text="Kosongkan Keranjang", command=self.clear_cart).pack(side=tk.LEFT, padx=5)
+
+    def setup_payment_frame(self, parent_frame):
+        payment_frame = ttk.LabelFrame(parent_frame, text="Pembayaran")
+        payment_frame.pack(fill=tk.BOTH, expand=False, padx=5, pady=5)
+        
+        # Tampilan subtotal, pajak, total
+        ttk.Label(payment_frame, text="Subtotal:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.subtotal_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 12))
+        self.subtotal_label.grid(row=0, column=1, padx=5, pady=5, sticky=tk.E)
+        
+        ttk.Label(payment_frame, text="PPN (11%):").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.tax_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 12))
+        self.tax_label.grid(row=1, column=1, padx=5, pady=5, sticky=tk.E)
+        
+        ttk.Separator(payment_frame, orient='horizontal').grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        
+        ttk.Label(payment_frame, text="TOTAL:", font=("Arial", 12, "bold")).grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
+        self.total_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 14, "bold"))
+        self.total_label.grid(row=3, column=1, padx=5, pady=5, sticky=tk.E)
+                # Metode pembayaran
         ttk.Label(payment_frame, text="Metode Pembayaran:").grid(row=4, column=0, padx=5, pady=5, sticky=tk.W)
         payment_methods = ["Tunai", "Kartu Kredit", "Kartu Debit", "QRIS"]
         payment_combo = ttk.Combobox(payment_frame, textvariable=self.payment_method_var, values=payment_methods, state="readonly")
@@ -419,58 +463,345 @@ class ProductInventorySystem:
         process_btn = ttk.Button(payment_frame, text="Proses Pembayaran", command=self.process_payment)
         process_btn.grid(row=7, column=0, columnspan=2, padx=5, pady=15, sticky=tk.W+tk.E)
 
-    def search_product_pos(self):
-        search_term = self.pos_search_var.get()
-        if not search_term:
-            messagebox.showwarning("Peringatan", "Masukkan barcode atau kata kunci")
-            return
+    def validate_numeric_input(self, P):
+        if P == "" or P == ".":
+            return True
+        try:
+            float(P)
+            return True
+        except ValueError:
+            return False
+
+    def generate_barcode(self):
+        # Generate random 13-digit barcode
+        random_barcode = ''.join(random.choices(string.digits, k=13))
+        self.barcode_var.set(random_barcode)
+
+    def toggle_camera(self):
+        if self.camera_active:
+            self.camera_active = False
+            if self.camera_thread and self.camera_thread.is_alive():
+                self.camera_thread.join(timeout=1.0)
+            self.camera_label.config(image='')
+        else:
+            self.camera_active = True
+            self.camera_thread = threading.Thread(
+                target=self.start_camera,
+                args=(self.camera_label, self.barcode_var, lambda: self.camera_active)
+            )
+            self.camera_thread.daemon = True
+            self.camera_thread.start()
+
+    def pos_scan_barcode(self):
+        if hasattr(self, 'pos_camera_active') and self.pos_camera_active:
+            self.pos_camera_active = False
+            if hasattr(self, 'pos_camera_thread') and self.pos_camera_thread and self.pos_camera_thread.is_alive():
+                self.pos_camera_thread.join(timeout=1.0)
+            self.pos_camera_label.config(image='')
+        else:
+            self.pos_camera_active = True
+            self.pos_camera_thread = threading.Thread(
+                target=self.start_camera,
+                args=(self.pos_camera_label, self.pos_barcode_var, lambda: self.pos_camera_active)
+            )
+            self.pos_camera_thread.daemon = True
+            self.pos_camera_thread.start()
+
+    def start_camera(self, label, barcode_var, active_check):
+        try:
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                messagebox.showerror("Error", "Tidak dapat mengakses kamera")
+                return
             
-        # Bersihkan hasil pencarian sebelumnya
-        for item in self.search_tree.get_children():
-            self.search_tree.delete(item)
+            while active_check():
+                ret, frame = cap.read()
+                if ret:
+                    # Decode barcodes
+                    barcodes = decode(frame)
+                    
+                    # Gambar persegi di sekitar barcode yang terdeteksi
+                    for barcode in barcodes:
+                        x, y, w, h = barcode.rect
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        
+                        # Ambil data barcode
+                        barcode_data = barcode.data.decode('utf-8')
+                        barcode_var.set(barcode_data)
+                        
+                        # Hentikan kamera setelah scan berhasil
+                        active_check = lambda: False
+                    
+                    # Konversi frame untuk ditampilkan
+                    cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+                    img = Image.fromarray(cv2image)
+                    imgtk = ImageTk.PhotoImage(image=img)
+                    label.imgtk = imgtk
+                    label.config(image=imgtk)
+                    label.update()
+                    
+                time.sleep(0.1)
+        except Exception as e:
+            messagebox.showerror("Error", f"Terjadi kesalahan saat menggunakan kamera: {str(e)}")
+        finally:
+            if 'cap' in locals():
+                cap.release()
+            label.config(image='')
+    def add_product(self):
+        try:
+            if not all([self.barcode_var.get(), self.product_name_var.get(), 
+                       self.capital_price_var.get(), self.selling_price_var.get(), 
+                       self.quantity_var.get(), self.low_stock_threshold_var.get()]):
+                messagebox.showerror("Error", "Semua field harus diisi")
+                return
+                
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT INTO products (
+                    barcode, name, capital_price, selling_price, 
+                    quantity, low_stock_threshold, date_added
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                self.barcode_var.get(),
+                self.product_name_var.get(),
+                float(self.capital_price_var.get()),
+                float(self.selling_price_var.get()),
+                int(self.quantity_var.get()),
+                int(self.low_stock_threshold_var.get()),
+                datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            ))
+            self.conn.commit()
+            
+            messagebox.showinfo("Sukses", "Produk berhasil ditambahkan")
+            self.clear_fields()
+            self.display_products()
+            
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Error", "Barcode sudah ada dalam database")
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal menambahkan produk: {str(e)}")
+
+    def update_product(self):
+        if not self.edit_id:
+            messagebox.showwarning("Peringatan", "Pilih produk yang akan diupdate")
+            return
             
         try:
             cursor = self.conn.cursor()
             cursor.execute('''
-                SELECT id, barcode, name, selling_price, quantity
-                FROM products
-                WHERE barcode LIKE ? OR name LIKE ?
-                ORDER BY name
-            ''', (f'%{search_term}%', f'%{search_term}%'))
+                UPDATE products 
+                SET barcode=?, name=?, capital_price=?, selling_price=?,
+                    quantity=?, low_stock_threshold=?, last_updated=?
+                WHERE id=?
+            ''', (
+                self.barcode_var.get(),
+                self.product_name_var.get(),
+                float(self.capital_price_var.get()),
+                float(self.selling_price_var.get()),
+                int(self.quantity_var.get()),
+                int(self.low_stock_threshold_var.get()),
+                datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                self.edit_id
+            ))
+            self.conn.commit()
             
-            results = cursor.fetchall()
+            messagebox.showinfo("Sukses", "Produk berhasil diupdate")
+            self.clear_fields()
+            self.display_products()
             
-            if not results:
-                messagebox.showinfo("Info", "Tidak ada produk yang ditemukan")
-                return
-                
-            for row in results:
-                # Format harga ke format rupiah
-                formatted_price = f"Rp {row[3]:,.2f}"
-                values = (row[0], row[1], row[2], formatted_price, row[4])
-                self.search_tree.insert('', 'end', values=values)
-                
         except Exception as e:
-            messagebox.showerror("Error", f"Gagal mencari produk: {str(e)}")
+            messagebox.showerror("Error", f"Gagal mengupdate produk: {str(e)}")
 
-    def select_search_result(self, event):
-        selected_item = self.search_tree.selection()
-        if not selected_item:
+    def delete_product(self):
+        if not self.edit_id:
+            messagebox.showwarning("Peringatan", "Pilih produk yang akan dihapus")
             return
             
-        # Ambil data produk yang dipilih
-        values = self.search_tree.item(selected_item[0])['values']
-        
-        # Set nilai untuk penambahan ke keranjang
-        self.pos_barcode_var.set(values[1])  # Barcode
-        
-        # Tambahkan ke keranjang
-        self.add_to_cart()
+        if messagebox.askyesno("Konfirmasi", "Yakin ingin menghapus produk ini?"):
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('DELETE FROM products WHERE id=?', (self.edit_id,))
+                self.conn.commit()
+                
+                messagebox.showinfo("Sukses", "Produk berhasil dihapus")
+                self.clear_fields()
+                self.display_products()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Gagal menghapus produk: {str(e)}")
 
+    def get_selected_product(self, event):
+        selected_item = self.product_tree.selection()
+        if selected_item:
+            item = self.product_tree.item(selected_item[0])
+            values = item['values']
+            
+            self.edit_id = values[0]
+            self.barcode_var.set(values[1])
+            self.product_name_var.set(values[2])
+            self.capital_price_var.set(values[3])
+            self.selling_price_var.set(values[4])
+            self.quantity_var.set(values[5])
+            self.low_stock_threshold_var.set(values[6])
+            self.edit_mode = True
+
+    def setup_reports_tab(self):
+        # Variabel untuk laporan
+        self.report_type_var = tk.StringVar()
+        self.report_type_var.set("Penjualan Harian")
+        self.date_from_var = tk.StringVar()
+        self.date_to_var = tk.StringVar()
+        
+        # Set tanggal default ke hari ini
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        self.date_from_var.set(today)
+        self.date_to_var.set(today)
+        
+        # Frame kontrol laporan
+        controls_frame = ttk.LabelFrame(self.reports_frame, text="Kontrol Laporan")
+        controls_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Jenis laporan
+        ttk.Label(controls_frame, text="Jenis Laporan:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        report_types = ["Penjualan Harian", "Penjualan Produk", "Pergerakan Inventaris", "Stok Rendah"]
+        report_combo = ttk.Combobox(controls_frame, textvariable=self.report_type_var, values=report_types, state="readonly", width=20)
+        report_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        
+        # Rentang tanggal
+        ttk.Label(controls_frame, text="Dari Tanggal:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
+        ttk.Entry(controls_frame, textvariable=self.date_from_var, width=12).grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(controls_frame, text="(YYYY-MM-DD)").grid(row=1, column=3, padx=5, pady=0, sticky=tk.W)
+        
+        ttk.Label(controls_frame, text="Sampai Tanggal:").grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
+        ttk.Entry(controls_frame, textvariable=self.date_to_var, width=12).grid(row=0, column=5, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(controls_frame, text="(YYYY-MM-DD)").grid(row=1, column=5, padx=5, pady=0, sticky=tk.W)
+        
+        ttk.Button(controls_frame, text="Generate Laporan", command=self.generate_report).grid(row=0, column=6, padx=20, pady=5, rowspan=2)
+        
+        # Frame hasil laporan
+        report_frame = ttk.LabelFrame(self.reports_frame, text="Hasil Laporan")
+        report_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Treeview untuk laporan
+        self.report_tree_frame = ttk.Frame(report_frame)
+        self.report_tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        report_scroll_y = ttk.Scrollbar(self.report_tree_frame)
+        report_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        report_scroll_x = ttk.Scrollbar(self.report_tree_frame, orient="horizontal")
+        report_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.report_tree = ttk.Treeview(self.report_tree_frame,
+                                       show="headings",
+                                       yscrollcommand=report_scroll_y.set,
+                                       xscrollcommand=report_scroll_x.set)
+        
+        report_scroll_y.config(command=self.report_tree.yview)
+        report_scroll_x.config(command=self.report_tree.xview)
+        
+        self.report_tree.pack(fill=tk.BOTH, expand=True)
+        
+        # Frame ringkasan laporan
+        self.report_summary_frame = ttk.Frame(report_frame)
+        self.report_summary_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Tombol export
+        ttk.Button(report_frame, text="Export Laporan", command=self.export_report).pack(pady=10)
+
+    def generate_report(self):
+        report_type = self.report_type_var.get()
+        date_from = self.date_from_var.get()
+        date_to = self.date_to_var.get()
+        
+        # Hapus kolom lama
+        for col in self.report_tree["columns"]:
+            self.report_tree.heading(col, text="")
+        self.report_tree["columns"] = ()
+        
+        # Hapus data lama
+        for item in self.report_tree.get_children():
+            self.report_tree.delete(item)
+            
+        try:
+            if report_type == "Penjualan Harian":
+                self.generate_daily_sales_report(date_from, date_to)
+            elif report_type == "Penjualan Produk":
+                self.generate_product_sales_report(date_from, date_to)
+            elif report_type == "Pergerakan Inventaris":
+                self.generate_inventory_movement_report(date_from, date_to)
+            elif report_type == "Stok Rendah":
+                self.generate_low_stock_report()
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal generate laporan: {str(e)}")
+
+    def export_report(self):
+        if not self.report_tree["columns"]:
+            messagebox.showwarning("Peringatan", "Tidak ada data untuk diexport")
+            return
+            
+        try:
+            # Buat folder laporan jika belum ada
+            if not os.path.exists('laporan'):
+                os.makedirs('laporan')
+                
+            filename = os.path.join('laporan', f"laporan_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.txt")
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                # Tulis header
+                headers = [self.report_tree.heading(col)["text"] for col in self.report_tree["columns"]]
+                f.write("\t".join(headers) + "\n")
+                
+                # Tulis data
+                for item in self.report_tree.get_children():
+                    values = [str(value) for value in self.report_tree.item(item)["values"]]
+                    f.write("\t".join(values) + "\n")
+                    
+            messagebox.showinfo("Sukses", f"Laporan tersimpan sebagai {filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal export laporan: {str(e)}")
+
+    def clear_fields(self):
+        self.barcode_var.set('')
+        self.product_name_var.set('')
+        self.capital_price_var.set('')
+        self.selling_price_var.set('')
+        self.quantity_var.set('')
+        self.low_stock_threshold_var.set('3')
+        self.edit_id = None
+        self.edit_mode = False
+
+    def display_products(self):
+        # Bersihkan treeview
+        for item in self.product_tree.get_children():
+            self.product_tree.delete(item)
+            
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT id, barcode, name, capital_price, selling_price,
+                       quantity, low_stock_threshold, date_added, last_updated
+                FROM products
+                ORDER BY name
+            ''')
+            
+            for row in cursor.fetchall():
+                status = "Stok Rendah" if row[5] <= row[6] else "Normal"
+                values = list(row) + [status]
+                
+                # Tambahkan tag untuk stok rendah
+                tags = ('low_stock',) if status == "Stok Rendah" else ()
+                
+                self.product_tree.insert('', 'end', values=values, tags=tags)
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal menampilkan produk: {str(e)}")
     def add_to_cart(self):
         barcode = self.pos_barcode_var.get()
         if not barcode:
-            messagebox.showwarning("Peringatan", "Silakan pilih produk terlebih dahulu")
+            messagebox.showwarning("Peringatan", "Silakan masukkan atau scan barcode produk")
             return
             
         try:
@@ -500,21 +831,7 @@ class ProductInventorySystem:
             messagebox.showwarning("Peringatan", f"Stok tidak mencukupi. Stok tersedia: {stock}")
             return
             
-        # Cek apakah produk sudah ada di keranjang
-        for item in self.cart_tree.get_children():
-            values = self.cart_tree.item(item)['values']
-            if values[0] == product_id:  # Jika produk sudah ada
-                new_qty = values[4] + qty
-                if new_qty > stock:
-                    messagebox.showwarning("Peringatan", f"Total quantity melebihi stok. Stok tersedia: {stock}")
-                    return
-                # Update quantity dan total
-                new_total = price * new_qty
-                self.cart_tree.item(item, values=(product_id, barcode, name, price, new_qty, new_total))
-                self.update_totals()
-                return
-            
-        # Jika produk belum ada di keranjang
+        # Tambahkan ke keranjang
         total = price * qty
         self.cart_tree.insert('', 'end', values=(product_id, barcode, name, price, qty, total))
         
@@ -522,7 +839,7 @@ class ProductInventorySystem:
         self.update_totals()
         
         # Reset input
-        self.pos_search_var.set('')
+        self.pos_barcode_var.set('')
         self.pos_qty_var.set('1')
 
     def update_totals(self):
@@ -533,39 +850,6 @@ class ProductInventorySystem:
         self.subtotal_label.config(text=f"Rp {subtotal:,.2f}")
         self.tax_label.config(text=f"Rp {tax:,.2f}")
         self.total_label.config(text=f"Rp {total:,.2f}")
-
-    def remove_from_cart(self):
-        selected_item = self.cart_tree.selection()
-        if not selected_item:
-            messagebox.showwarning("Peringatan", "Pilih item yang akan dihapus")
-            return
-            
-        self.cart_tree.delete(selected_item)
-        self.update_totals()
-
-    def clear_cart(self):
-        if not self.cart_tree.get_children():
-            messagebox.showwarning("Peringatan", "Keranjang sudah kosong")
-            return
-            
-        if messagebox.askyesno("Konfirmasi", "Yakin ingin mengosongkan keranjang?"):
-            for item in self.cart_tree.get_children():
-                self.cart_tree.delete(item)
-            self.update_totals()
-            
-            # Reset form pembayaran
-            self.customer_name_var.set('')
-            self.notes_var.set('')
-            self.payment_method_var.set('Tunai')
-
-
-    def display_products(self):
-        """Menampilkan semua produk di treeview"""
-        # Reset search field
-        self.search_var.set('')
-        
-        # Tampilkan semua produk
-        self.load_products()
 
     def process_payment(self):
         if not self.cart_tree.get_children():
@@ -687,501 +971,120 @@ class ProductInventorySystem:
         except Exception as e:
             messagebox.showerror("Error", f"Gagal menyimpan struk: {str(e)}")
 
-
-    def display_low_stock(self):
-        """Menampilkan produk dengan stok di bawah 10"""
-        # Bersihkan treeview
-        for item in self.product_tree.get_children():
-            self.product_tree.delete(item)
-            
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT id, name, barcode, price, quantity, last_updated 
-                FROM products 
-                WHERE quantity < 10
-                ORDER BY quantity ASC
-            ''')
-            
-            # Tampilkan hasil di treeview
-            for row in cursor.fetchall():
-                self.product_tree.insert('', 'end', values=(
-                    row[0],  # ID
-                    row[1],  # Nama
-                    row[2],  # Barcode
-                    f"{row[3]:,.2f}",  # Harga
-                    row[4],  # Jumlah
-                    row[5]   # Terakhir diupdate
-                ), tags=('low_stock',) if row[4] < 5 else ())
-            
-            # Konfigurasi warna untuk stok rendah
-            self.product_tree.tag_configure('low_stock', foreground='red')
-                
-            if not self.product_tree.get_children():
-                messagebox.showinfo("Info", "Tidak ada produk dengan stok rendah")
-                self.load_products()  # Tampilkan kembali semua produk
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Gagal memuat data stok rendah: {str(e)}")
-
-    def generate_barcode(self):
-        # Generate barcode 13 digit: 
-        # 2 digit prefix + 10 digit random + 1 digit checksum
-        prefix = "20"  # Bisa disesuaikan dengan kebutuhan
-        random_numbers = ''.join(random.choices(string.digits, k=10))
-        barcode = f"{prefix}{random_numbers}"
-        
-        # Hitung checksum
-        total = 0
-        for i in range(12):
-            digit = int(barcode[i])
-            if i % 2 == 0:
-                total += digit
-            else:
-                total += digit * 3
-        
-        checksum = (10 - (total % 10)) % 10
-        barcode = f"{barcode}{checksum}"
-        
-        self.barcode_var.set(barcode)
-
-    def validate_numeric_input(self, P):
-        if P == "" or P == ".":
-            return True
-        try:
-            float(P)
-            return True
-        except ValueError:
-            return False
-
-    def backup_database(self):
-        try:
-            # Buat nama file backup dengan timestamp
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            backup_path = os.path.join('backup', f'inventory_backup_{timestamp}.db')
-            
-            # Buat backup
-            backup_conn = sqlite3.connect(backup_path)
-            self.conn.backup(backup_conn)
-            backup_conn.close()
-            
-            messagebox.showinfo("Sukses", f"Database berhasil dibackup ke:\n{backup_path}")
-        except sqlite3.Error as e:
-            messagebox.showerror("Error", f"Gagal backup database: {str(e)}")
-
-    def add_product(self):
-        # Validasi input
-        if not all([
-            self.name_var.get().strip(),
-            self.barcode_var.get().strip(),
-            self.price_var.get().strip(),
-            self.quantity_var.get().strip()
-        ]):
-            messagebox.showwarning("Peringatan", "Semua field harus diisi!")
-            return
-
-        try:
-            # Ambil data dari form
-            name = self.name_var.get().strip()
-            barcode = self.barcode_var.get().strip()
-            price = float(self.price_var.get())
-            quantity = int(self.quantity_var.get())
-            
-            # Cek apakah barcode sudah ada
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT id FROM products WHERE barcode = ?", (barcode,))
-            if cursor.fetchone():
-                messagebox.showerror("Error", "Barcode sudah terdaftar!")
-                return
-            
-            # Tambah produk ke database
-            cursor.execute('''
-                INSERT INTO products (name, barcode, price, quantity, last_updated)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (
-                name,
-                barcode,
-                price,
-                quantity,
-                datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            ))
-            
-            self.conn.commit()
-            messagebox.showinfo("Sukses", "Produk berhasil ditambahkan!")
-            
-            # Reset form
-            self.name_var.set('')
-            self.barcode_var.set('')
-            self.price_var.set('')
-            self.quantity_var.set('')
-            
-            # Refresh tabel produk
-            self.load_products()
-            
-        except ValueError:
-            messagebox.showerror("Error", "Harga dan jumlah harus berupa angka!")
-        except Exception as e:
-            self.conn.rollback()
-            messagebox.showerror("Error", f"Gagal menambah produk: {str(e)}")
-
-    def load_products(self):
-        # Bersihkan treeview
-        for item in self.product_tree.get_children():
-            self.product_tree.delete(item)
-            
-        try:
-            # Ambil data dari database
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT id, name, barcode, price, quantity, last_updated 
-                FROM products 
-                ORDER BY name
-            ''')
-            
-            # Tampilkan di treeview
-            for row in cursor.fetchall():
-                self.product_tree.insert('', 'end', values=(
-                    row[0],  # ID
-                    row[1],  # Nama
-                    row[2],  # Barcode
-                    f"{row[3]:,.2f}",  # Harga
-                    row[4],  # Jumlah
-                    row[5]   # Terakhir diupdate
-                ))
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Gagal memuat data produk: {str(e)}")
-
-    def update_product(self):
-        selected_item = self.product_tree.selection()
-        if not selected_item:
-            messagebox.showwarning("Peringatan", "Pilih produk yang akan diupdate!")
-            return
-            
-        # Validasi input
-        if not all([
-            self.name_var.get().strip(),
-            self.barcode_var.get().strip(),
-            self.price_var.get().strip(),
-            self.quantity_var.get().strip()
-        ]):
-            messagebox.showwarning("Peringatan", "Semua field harus diisi!")
-            return
-            
-        try:
-            # Ambil data dari form
-            name = self.name_var.get().strip()
-            barcode = self.barcode_var.get().strip()
-            price = float(self.price_var.get())
-            quantity = int(self.quantity_var.get())
-            
-            # Ambil ID produk dari item yang dipilih
-            product_id = self.product_tree.item(selected_item)['values'][0]
-            
-            # Cek apakah barcode sudah digunakan produk lain
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT id FROM products WHERE barcode = ? AND id != ?", 
-                         (barcode, product_id))
-            if cursor.fetchone():
-                messagebox.showerror("Error", "Barcode sudah digunakan produk lain!")
-                return
-            
-            # Update produk di database
-            cursor.execute('''
-                UPDATE products 
-                SET name = ?, 
-                    barcode = ?, 
-                    price = ?, 
-                    quantity = ?,
-                    last_updated = ?
-                WHERE id = ?
-            ''', (
-                name,
-                barcode,
-                price,
-                quantity,
-                datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                product_id
-            ))
-            
-            self.conn.commit()
-            messagebox.showinfo("Sukses", "Produk berhasil diupdate!")
-            
-            # Reset form
-            self.name_var.set('')
-            self.barcode_var.set('')
-            self.price_var.set('')
-            self.quantity_var.set('')
-            
-            # Refresh tabel produk
-            self.load_products()
-            
-        except ValueError:
-            messagebox.showerror("Error", "Harga dan jumlah harus berupa angka!")
-        except Exception as e:
-            self.conn.rollback()
-            messagebox.showerror("Error", f"Gagal mengupdate produk: {str(e)}")
-
-    def select_product(self, event):
-        selected_item = self.product_tree.selection()
-        if selected_item:
-            # Ambil data produk yang dipilih
-            values = self.product_tree.item(selected_item)['values']
-            
-            # Isi form dengan data produk
-            self.name_var.set(values[1])      # Nama
-            self.barcode_var.set(values[2])   # Barcode
-            self.price_var.set(values[3])     # Harga
-            self.quantity_var.set(values[4])  # Jumlah
-
-    def delete_product(self):
-        selected_item = self.product_tree.selection()
-        if not selected_item:
-            messagebox.showwarning("Peringatan", "Pilih produk yang akan dihapus!")
-            return
-            
-        if not messagebox.askyesno("Konfirmasi", "Yakin ingin menghapus produk ini?"):
-            return
-            
-        try:
-            # Ambil ID produk dari item yang dipilih
-            product_id = self.product_tree.item(selected_item)['values'][0]
-            
-            # Hapus produk dari database
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
-            self.conn.commit()
-            
-            messagebox.showinfo("Sukses", "Produk berhasil dihapus!")
-            
-            # Reset form
-            self.name_var.set('')
-            self.barcode_var.set('')
-            self.price_var.set('')
-            self.quantity_var.set('')
-            
-            # Refresh tabel produk
-            self.load_products()
-            
-        except Exception as e:
-            self.conn.rollback()
-            messagebox.showerror("Error", f"Gagal menghapus produk: {str(e)}")
-
-    def clear_fields(self):
-        """Bersihkan semua field input di form inventory"""
-        self.name_var.set('')
-        self.barcode_var.set('')
-        self.price_var.set('')
-        self.quantity_var.set('')
-        
-        # Hapus seleksi di treeview jika ada
-        if self.product_tree.selection():
-            self.product_tree.selection_remove(self.product_tree.selection())
-
-
-    def setup_reports_tab(self):
-        """Setup tab untuk laporan penjualan"""
-        # Frame utama
-        main_frame = ttk.Frame(self.reports_tab, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Frame untuk filter
-        filter_frame = ttk.LabelFrame(main_frame, text="Filter Laporan", padding=10)
-        filter_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Tanggal mulai
-        ttk.Label(filter_frame, text="Dari:").pack(side=tk.LEFT)
-        self.start_date = DateEntry(filter_frame, width=12, background='darkblue',
-                                  foreground='white', borderwidth=2)
-        self.start_date.pack(side=tk.LEFT, padx=5)
-        
-        # Tanggal akhir
-        ttk.Label(filter_frame, text="Sampai:").pack(side=tk.LEFT)
-        self.end_date = DateEntry(filter_frame, width=12, background='darkblue',
-                                foreground='white', borderwidth=2)
-        self.end_date.pack(side=tk.LEFT, padx=5)
-        
-        # Tombol filter
-        ttk.Button(filter_frame, text="Tampilkan", 
-                  command=self.show_sales_report).pack(side=tk.LEFT, padx=5)
-        ttk.Button(filter_frame, text="Export Excel", 
-                  command=self.export_to_excel).pack(side=tk.LEFT)
-        
-        # Frame untuk tabel
-        table_frame = ttk.Frame(main_frame)
-        table_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-        
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(table_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Treeview untuk laporan
-        self.report_tree = ttk.Treeview(
-            table_frame,
-            columns=('No', 'Tanggal', 'Invoice', 'Total', 'Metode', 'Customer'),
-            show='headings',
-            yscrollcommand=scrollbar.set
-        )
-        
-        # Konfigurasi scrollbar
-        scrollbar.config(command=self.report_tree.yview)
-        
-        # Konfigurasi kolom
-        self.report_tree.heading('No', text='No')
-        self.report_tree.heading('Tanggal', text='Tanggal')
-        self.report_tree.heading('Invoice', text='No Invoice')
-        self.report_tree.heading('Total', text='Total')
-        self.report_tree.heading('Metode', text='Metode Bayar')
-        self.report_tree.heading('Customer', text='Customer')
-        
-        # Atur lebar kolom
-        self.report_tree.column('No', width=50)
-        self.report_tree.column('Tanggal', width=150)
-        self.report_tree.column('Invoice', width=150)
-        self.report_tree.column('Total', width=150)
-        self.report_tree.column('Metode', width=100)
-        self.report_tree.column('Customer', width=150)
-        
-        self.report_tree.pack(fill=tk.BOTH, expand=True)
-        
-        # Frame untuk summary
-        summary_frame = ttk.LabelFrame(main_frame, text="Ringkasan", padding=10)
-        summary_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Label untuk total
-        self.total_sales_label = ttk.Label(summary_frame, text="Total Penjualan: Rp 0")
-        self.total_sales_label.pack(side=tk.LEFT, padx=10)
-        
-        self.total_transactions_label = ttk.Label(summary_frame, text="Jumlah Transaksi: 0")
-        self.total_transactions_label.pack(side=tk.LEFT, padx=10)
-
-    def show_sales_report(self):
-        """Menampilkan laporan penjualan sesuai filter tanggal"""
-        # Bersihkan treeview
-        for item in self.report_tree.get_children():
-            self.report_tree.delete(item)
-            
-        try:
-            start_date = self.start_date.get_date().strftime('%Y-%m-%d')
-            end_date = self.end_date.get_date().strftime('%Y-%m-%d')
-            
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT date, transaction_id, total_amount, payment_method, 
-                       customer_name
-                FROM sales 
-                WHERE date BETWEEN ? AND ?
-                ORDER BY date DESC
-            ''', (f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
-            
-            total_amount = 0
-            for idx, row in enumerate(cursor.fetchall(), 1):
-                self.report_tree.insert('', 'end', values=(
-                    idx,
-                    row[0],
-                    row[1],
-                    f"Rp {row[2]:,.2f}",
-                    row[3],
-                    row[4] or '-'
-                ))
-                total_amount += row[2]
-            
-            # Update summary
-            self.total_sales_label.config(
-                text=f"Total Penjualan: Rp {total_amount:,.2f}")
-            self.total_transactions_label.config(
-                text=f"Jumlah Transaksi: {idx}")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Gagal memuat laporan: {str(e)}")
-
-    def export_to_excel(self):
-        """Export laporan ke file Excel"""
-        try:
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".xlsx",
-                filetypes=[("Excel files", "*.xlsx")],
-                title="Simpan Laporan"
-            )
-            
-            if not filename:
-                return
-                
-            # Buat workbook baru
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Laporan Penjualan"
-            
-            # Tulis header
-            headers = ['No', 'Tanggal', 'No Invoice', 'Total', 'Metode Bayar', 'Customer']
-            for col, header in enumerate(headers, 1):
-                ws.cell(row=1, column=col, value=header)
-            
-            # Tulis data
-            for idx, item in enumerate(self.report_tree.get_children(), 2):
-                values = self.report_tree.item(item)['values']
-                for col, value in enumerate(values, 1):
-                    if col == 4:  # Kolom total
-                        # Hapus "Rp " dan koma dari string
-                        value = float(value.replace("Rp ", "").replace(",", ""))
-                    ws.cell(row=idx, column=col, value=value)
-            
-            # Simpan file
-            wb.save(filename)
-            messagebox.showinfo("Sukses", f"Laporan berhasil disimpan ke:\n{filename}")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Gagal export laporan: {str(e)}")
-
     def search_products(self):
-        search_term = self.search_var.get().strip()
-        
+        search_term = self.search_var.get()
+        if not search_term:
+            self.display_products()
+            return
+            
         # Bersihkan treeview
         for item in self.product_tree.get_children():
             self.product_tree.delete(item)
             
         try:
             cursor = self.conn.cursor()
-            
-            # Jika search term kosong, tampilkan semua produk
-            if not search_term:
-                self.load_products()
-                return
-                
-            # Cari produk berdasarkan nama atau barcode
             cursor.execute('''
-                SELECT id, name, barcode, price, quantity, last_updated 
-                FROM products 
-                WHERE name LIKE ? OR barcode LIKE ?
+                SELECT id, barcode, name, capital_price, selling_price,
+                       quantity, low_stock_threshold, date_added, last_updated
+                FROM products
+                WHERE barcode LIKE ? OR name LIKE ?
                 ORDER BY name
             ''', (f'%{search_term}%', f'%{search_term}%'))
             
-            # Tampilkan hasil pencarian di treeview
             for row in cursor.fetchall():
-                self.product_tree.insert('', 'end', values=(
-                    row[0],  # ID
-                    row[1],  # Nama
-                    row[2],  # Barcode
-                    f"{row[3]:,.2f}",  # Harga
-                    row[4],  # Jumlah
-                    row[5]   # Terakhir diupdate
-                ))
+                status = "Stok Rendah" if row[5] <= row[6] else "Normal"
+                values = list(row) + [status]
                 
-            if not self.product_tree.get_children():
-                messagebox.showinfo("Info", "Tidak ada produk yang ditemukan")
-                self.load_products()  # Tampilkan kembali semua produk
+                # Tambahkan tag untuk stok rendah
+                tags = ('low_stock',) if status == "Stok Rendah" else ()
+                
+                self.product_tree.insert('', 'end', values=values, tags=tags)
                 
         except Exception as e:
             messagebox.showerror("Error", f"Gagal mencari produk: {str(e)}")
+    def remove_from_cart(self):
+        selected_item = self.cart_tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Peringatan", "Pilih item yang akan dihapus")
+            return
+            
+        self.cart_tree.delete(selected_item)
+        self.update_totals()
+
+    def clear_cart(self):
+        if not self.cart_tree.get_children():
+            messagebox.showwarning("Peringatan", "Keranjang sudah kosong")
+            return
+            
+        if messagebox.askyesno("Konfirmasi", "Yakin ingin mengosongkan keranjang?"):
+            for item in self.cart_tree.get_children():
+                self.cart_tree.delete(item)
+            self.update_totals()
+            
+            # Reset form pembayaran
+            self.customer_name_var.set('')
+            self.notes_var.set('')
+            self.payment_method_var.set('Tunai')
+    def display_low_stock(self):
+        # Bersihkan treeview
+        for item in self.product_tree.get_children():
+            self.product_tree.delete(item)
+            
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT id, barcode, name, capital_price, selling_price,
+                       quantity, low_stock_threshold, date_added, last_updated
+                FROM products
+                WHERE quantity <= low_stock_threshold
+                ORDER BY name
+            ''')
+            
+            for row in cursor.fetchall():
+                status = "Stok Rendah"
+                values = list(row) + [status]
+                
+                self.product_tree.insert('', 'end', values=values, tags=('low_stock',))
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal menampilkan produk stok rendah: {str(e)}")
+
+    def check_low_inventory(self):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT name, quantity, low_stock_threshold 
+                FROM products 
+                WHERE quantity <= low_stock_threshold
+            ''')
+            low_stock_items = cursor.fetchall()
+            
+            if low_stock_items:
+                message = "Produk dengan stok rendah:\n\n"
+                for item in low_stock_items:
+                    message += f"- {item[0]}: {item[1]} (Batas: {item[2]})\n"
+                messagebox.showwarning("Peringatan Stok Rendah", message)
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal memeriksa stok: {str(e)}")
 
     def on_closing(self):
-        if messagebox.askokcancel("Keluar", "Yakin ingin keluar?"):
-            # Tutup koneksi database
-            if hasattr(self, 'conn'):
-                self.conn.close()
-            
-            # Hancurkan window utama
-            self.root.destroy()
+        # Hentikan kamera yang aktif
+        self.camera_active = False
+        if hasattr(self, 'pos_camera_active'):
+            self.pos_camera_active = False
+        
+        # Tunggu thread kamera selesai
+        if hasattr(self, 'camera_thread') and self.camera_thread and self.camera_thread.is_alive():
+            self.camera_thread.join(timeout=1.0)
+        if hasattr(self, 'pos_camera_thread') and self.pos_camera_thread and self.pos_camera_thread.is_alive():
+            self.pos_camera_thread.join(timeout=1.0)
+        
+        # Tutup koneksi database
+        if hasattr(self, 'conn'):
+            self.conn.close()
+        
+        # Hancurkan window utama
+        self.root.destroy()
 
 # Jalankan aplikasi
 if __name__ == "__main__":
