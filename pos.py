@@ -11,6 +11,12 @@ from pyzbar.pyzbar import decode
 import threading
 import time
 import os
+import logging
+import configparser
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ProductInventorySystem:
     def __init__(self, root):
@@ -19,8 +25,25 @@ class ProductInventorySystem:
         self.root.geometry("1200x700")
         self.root.resizable(True, True)
         
+        # Load configuration
+        self.config = configparser.ConfigParser()
+        self.config.read('config.ini')
+        
+        # Set default values if not present
+        if 'Database' not in self.config:
+            self.config['Database'] = {'path': 'inventory.db'}
+        if 'Tax' not in self.config:
+            self.config['Tax'] = {'rate': '0.11'}
+            
+        self.db_path = self.config['Database']['path']
+        self.tax_rate = float(self.config['Tax']['rate'])
+        
+        # Save configuration
+        with open('config.ini', 'w') as configfile:
+            self.config.write(configfile)
+        
         # Koneksi ke database SQLite
-        self.conn = sqlite3.connect('inventory.db')
+        self.conn = sqlite3.connect(self.db_path)
         self.create_tables()
         
         # Buat notebook untuk tab berbeda
@@ -53,65 +76,70 @@ class ProductInventorySystem:
         self.check_low_inventory()
 
     def create_tables(self):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            barcode TEXT UNIQUE,
-            name TEXT NOT NULL,
-            capital_price REAL NOT NULL,
-            selling_price REAL NOT NULL,
-            quantity INTEGER NOT NULL,
-            date_added TEXT NOT NULL,
-            last_updated TEXT,
-            low_stock_threshold INTEGER DEFAULT 3
-        )
-        ''')
-        
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS inventory_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER,
-            action TEXT,
-            previous_qty INTEGER,
-            change_qty INTEGER,
-            new_qty INTEGER,
-            date TEXT,
-            FOREIGN KEY (product_id) REFERENCES products (id)
-        )
-        ''')
-        
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            transaction_id TEXT NOT NULL,
-            date TEXT NOT NULL,
-            total_items INTEGER NOT NULL,
-            subtotal REAL NOT NULL,
-            tax REAL NOT NULL,
-            total_amount REAL NOT NULL,
-            payment_method TEXT NOT NULL,
-            customer_name TEXT,
-            notes TEXT
-        )
-        ''')
-        
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sale_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            transaction_id TEXT NOT NULL,
-            product_id INTEGER NOT NULL,
-            product_name TEXT NOT NULL,
-            barcode TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            unit_price REAL NOT NULL,
-            discount REAL DEFAULT 0,
-            total_price REAL NOT NULL,
-            FOREIGN KEY (product_id) REFERENCES products (id)
-        )
-        ''')
-        
-        self.conn.commit()    
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                barcode TEXT UNIQUE,
+                name TEXT NOT NULL,
+                capital_price REAL NOT NULL,
+                selling_price REAL NOT NULL,
+                quantity INTEGER NOT NULL,
+                date_added TEXT NOT NULL,
+                last_updated TEXT,
+                low_stock_threshold INTEGER DEFAULT 3
+            )
+            ''')
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inventory_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER,
+                action TEXT,
+                previous_qty INTEGER,
+                change_qty INTEGER,
+                new_qty INTEGER,
+                date TEXT,
+                FOREIGN KEY (product_id) REFERENCES products (id)
+            )
+            ''')
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                total_items INTEGER NOT NULL,
+                subtotal REAL NOT NULL,
+                tax REAL NOT NULL,
+                total_amount REAL NOT NULL,
+                payment_method TEXT NOT NULL,
+                customer_name TEXT,
+                notes TEXT
+            )
+            ''')
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sale_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_id TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                product_name TEXT NOT NULL,
+                barcode TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit_price REAL NOT NULL,
+                discount REAL DEFAULT 0,
+                total_price REAL NOT NULL,
+                FOREIGN KEY (product_id) REFERENCES products (id)
+            )
+            ''')
+            
+            self.conn.commit()
+            logging.info("Tables created successfully.")
+        except sqlite3.Error as e:
+            logging.error(f"Database error: {e}")
+            messagebox.showerror("Error", f"Database error: {str(e)}")
     def setup_inventory_tab(self):
         # Variabel untuk inventaris
         self.barcode_var = tk.StringVar()
@@ -121,8 +149,6 @@ class ProductInventorySystem:
         self.quantity_var = tk.StringVar()
         self.low_stock_threshold_var = tk.StringVar()
         self.search_var = tk.StringVar()
-        self.camera_active = False
-        self.camera_thread = None
         self.edit_mode = False
         self.edit_id = None
         
@@ -143,7 +169,6 @@ class ProductInventorySystem:
         self.barcode_entry = ttk.Entry(left_frame, textvariable=self.barcode_var, width=30)
         self.barcode_entry.grid(row=0, column=1, padx=10, pady=5, sticky=tk.W)
         
-        ttk.Button(left_frame, text="Scan Barcode", command=self.toggle_camera).grid(row=0, column=2, padx=10, pady=5)
         ttk.Button(left_frame, text="Generate Otomatis", command=self.generate_barcode).grid(row=0, column=3, padx=10, pady=5)
         
        
@@ -266,14 +291,141 @@ class ProductInventorySystem:
         pos_right_frame = ttk.Frame(pos_main_frame)
         pos_right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5, ipadx=10)
         
-        # Setup frame input produk
-        self.setup_product_entry_frame(pos_left_frame)
+        # Add search functionality
+        self.setup_pos_search_frame(pos_left_frame)
         
         # Setup frame keranjang
         self.setup_cart_frame(pos_left_frame)
         
         # Setup frame pembayaran
         self.setup_payment_frame(pos_right_frame)
+
+    def setup_pos_search_frame(self, parent_frame):
+        search_frame = ttk.LabelFrame(parent_frame, text="Cari Produk")
+        search_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(search_frame, text="Cari (Barcode/Nama):").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.pos_search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=self.pos_search_var, width=30)
+        search_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        search_entry.bind("<Return>", lambda event: self.search_pos_products())  # Bind Enter key to search
+
+        ttk.Button(search_frame, text="Cari", command=self.search_pos_products).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(search_frame, text="Reset", command=self.reset_pos_search).grid(row=0, column=3, padx=5, pady=5)
+
+        # Treeview for search results
+        self.pos_search_tree = ttk.Treeview(search_frame,
+                                            columns=("id", "barcode", "name", "price", "stock"),
+                                            show="headings",
+                                            height=5)
+        self.pos_search_tree.grid(row=1, column=0, columnspan=4, padx=5, pady=5, sticky=tk.W+tk.E)
+
+        self.pos_search_tree.heading("id", text="ID")
+        self.pos_search_tree.heading("barcode", text="Barcode")
+        self.pos_search_tree.heading("name", text="Nama Produk")
+        self.pos_search_tree.heading("price", text="Harga Jual")
+        self.pos_search_tree.heading("stock", text="Stok")
+
+        self.pos_search_tree.column("id", width=50)
+        self.pos_search_tree.column("barcode", width=120)
+        self.pos_search_tree.column("name", width=200)
+        self.pos_search_tree.column("price", width=100)
+        self.pos_search_tree.column("stock", width=80)
+
+        self.pos_search_tree.bind("<Double-1>", self.select_pos_product)
+
+    def search_pos_products(self):
+        search_term = self.pos_search_var.get()
+        if not search_term:
+            messagebox.showwarning("Peringatan", "Masukkan barcode atau nama produk untuk mencari.")
+            return
+
+        # Clear previous search results
+        for item in self.pos_search_tree.get_children():
+            self.pos_search_tree.delete(item)
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT id, barcode, name, selling_price, quantity
+                FROM products
+                WHERE barcode LIKE ? OR name LIKE ?
+                ORDER BY name
+            ''', (f'%{search_term}%', f'%{search_term}%'))
+
+            results = cursor.fetchall()
+
+            if len(results) == 1 and results[0][1] == search_term:  # Exact barcode match
+                product_id, barcode, name, price, stock = results[0]
+                if stock <= 0:
+                    messagebox.showwarning("Peringatan", "Stok tidak mencukupi.")
+                    return
+
+                # Check if the product is already in the cart
+                for item in self.cart_tree.get_children():
+                    values = self.cart_tree.item(item)['values']
+                    if values[1] == barcode:  # Match by barcode
+                        new_qty = values[4] + 1
+                        if new_qty > stock:
+                            messagebox.showwarning("Peringatan", f"Stok tidak mencukupi. Stok tersedia: {stock}")
+                            return
+                        new_total = new_qty * price
+                        self.cart_tree.item(item, values=(values[0], values[1], values[2], values[3], new_qty, new_total))
+                        self.update_totals()
+                        self.pos_search_var.set('')  # Clear search field
+                        messagebox.showinfo("Sukses", f"Jumlah produk '{name}' di keranjang diperbarui.")
+                        return
+
+                # Add new product to the cart
+                self.cart_tree.insert('', 'end', values=(product_id, barcode, name, price, 1, price))
+                self.update_totals()
+                self.pos_search_var.set('')  # Clear search field
+                messagebox.showinfo("Sukses", f"Produk '{name}' berhasil ditambahkan ke keranjang.")
+            else:
+                # Populate search results for manual selection
+                for row in results:
+                    self.pos_search_tree.insert('', 'end', values=row)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal mencari produk: {str(e)}")
+
+    def reset_pos_search(self):
+        self.pos_search_var.set('')
+        for item in self.pos_search_tree.get_children():
+            self.pos_search_tree.delete(item)
+
+    def select_pos_product(self, event):
+        selected_item = self.pos_search_tree.selection()
+        if selected_item:
+            item = self.pos_search_tree.item(selected_item[0])
+            values = item['values']
+            product_id, barcode, name, price, stock = values
+
+            if stock <= 0:
+                messagebox.showwarning("Peringatan", "Stok tidak mencukupi.")
+                return
+
+            # Check if the product is already in the cart
+            for cart_item in self.cart_tree.get_children():
+                cart_values = self.cart_tree.item(cart_item)['values']
+                if cart_values[1] == barcode:  # Match by barcode
+                    new_qty = cart_values[4] + 1
+                    if new_qty > stock:
+                        messagebox.showwarning("Peringatan", f"Stok tidak mencukupi. Stok tersedia: {stock}")
+                        return
+                    new_total = new_qty * price
+                    self.cart_tree.item(cart_item, values=(cart_values[0], cart_values[1], cart_values[2], cart_values[3], new_qty, new_total))
+                    self.update_totals()
+                    self.pos_search_var.set('')  # Clear search field
+                    messagebox.showinfo("Sukses", f"Jumlah produk '{name}' di keranjang diperbarui.")
+                    return
+
+            # Add new product to the cart
+            self.cart_tree.insert('', 'end', values=(product_id, barcode, name, price, 1, price))
+            self.update_totals()
+            self.pos_search_var.set('')  # Clear search field
+            messagebox.showinfo("Sukses", f"Produk '{name}' berhasil ditambahkan ke keranjang.")
+
     def setup_product_entry_frame(self, parent_frame):
         entry_frame = ttk.LabelFrame(parent_frame, text="Input Produk")
         entry_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -283,102 +435,10 @@ class ProductInventorySystem:
         barcode_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
         barcode_entry.bind("<Return>", lambda event: self.add_to_cart())
         
-        ttk.Button(entry_frame, text="Scan", command=self.pos_scan_barcode).grid(row=0, column=2, padx=5, pady=5)
-        
         ttk.Label(entry_frame, text="Jumlah:").grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
         ttk.Entry(entry_frame, textvariable=self.pos_qty_var, width=5).grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
         
         ttk.Button(entry_frame, text="Tambah ke Keranjang", command=self.add_to_cart).grid(row=0, column=5, padx=5, pady=5)
-        
-        # Label kamera untuk POS scanning
-        self.pos_camera_label = ttk.Label(entry_frame)
-        self.pos_camera_label.grid(row=1, column=0, columnspan=6, padx=5, pady=5)
-
-    def setup_cart_frame(self, parent_frame):
-        cart_frame = ttk.LabelFrame(parent_frame, text="Keranjang Belanja")
-        cart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Treeview keranjang
-        cart_tree_frame = ttk.Frame(cart_frame)
-        cart_tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        cart_scroll_y = ttk.Scrollbar(cart_tree_frame)
-        cart_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        cart_scroll_x = ttk.Scrollbar(cart_tree_frame, orient="horizontal")
-        cart_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
-        
-        self.cart_tree = ttk.Treeview(cart_tree_frame,
-                                     columns=("id", "barcode", "name", "price", "qty", "total"),
-                                     show="headings",
-                                     yscrollcommand=cart_scroll_y.set,
-                                     xscrollcommand=cart_scroll_x.set)
-        
-        cart_scroll_y.config(command=self.cart_tree.yview)
-        cart_scroll_x.config(command=self.cart_tree.xview)
-        
-        # Definisi kolom keranjang
-        self.cart_tree.heading("id", text="ID")
-        self.cart_tree.heading("barcode", text="Barcode")
-        self.cart_tree.heading("name", text="Produk")
-        self.cart_tree.heading("price", text="Harga Satuan")
-        self.cart_tree.heading("qty", text="Jumlah")
-        self.cart_tree.heading("total", text="Total")
-        
-        # Konfigurasi lebar kolom
-        self.cart_tree.column("id", width=50)
-        self.cart_tree.column("barcode", width=100)
-        self.cart_tree.column("name", width=250)
-        self.cart_tree.column("price", width=100)
-        self.cart_tree.column("qty", width=60)
-        self.cart_tree.column("total", width=100)
-        
-        self.cart_tree.pack(fill=tk.BOTH, expand=True)
-        
-        # Tombol keranjang
-        cart_btn_frame = ttk.Frame(cart_frame)
-        cart_btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Button(cart_btn_frame, text="Hapus Item", command=self.remove_from_cart).pack(side=tk.LEFT, padx=5)
-        ttk.Button(cart_btn_frame, text="Kosongkan Keranjang", command=self.clear_cart).pack(side=tk.LEFT, padx=5)
-
-    def setup_payment_frame(self, parent_frame):
-        payment_frame = ttk.LabelFrame(parent_frame, text="Pembayaran")
-        payment_frame.pack(fill=tk.BOTH, expand=False, padx=5, pady=5)
-        
-        # Tampilan subtotal, pajak, total
-        ttk.Label(payment_frame, text="Subtotal:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.subtotal_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 12))
-        self.subtotal_label.grid(row=0, column=1, padx=5, pady=5, sticky=tk.E)
-        
-        ttk.Label(payment_frame, text="PPN (11%):").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.tax_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 12))
-        self.tax_label.grid(row=1, column=1, padx=5, pady=5, sticky=tk.E)
-        
-        ttk.Separator(payment_frame, orient='horizontal').grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
-        
-        ttk.Label(payment_frame, text="TOTAL:", font=("Arial", 12, "bold")).grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
-        self.total_label = ttk.Label(payment_frame, text="Rp 0", font=("Arial", 14, "bold"))
-        self.total_label.grid(row=3, column=1, padx=5, pady=5, sticky=tk.E)
-    def setup_product_entry_frame(self, parent_frame):
-        entry_frame = ttk.LabelFrame(parent_frame, text="Input Produk")
-        entry_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(entry_frame, text="Barcode:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        barcode_entry = ttk.Entry(entry_frame, textvariable=self.pos_barcode_var, width=20)
-        barcode_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
-        barcode_entry.bind("<Return>", lambda event: self.add_to_cart())
-        
-        ttk.Button(entry_frame, text="Scan", command=self.pos_scan_barcode).grid(row=0, column=2, padx=5, pady=5)
-        
-        ttk.Label(entry_frame, text="Jumlah:").grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(entry_frame, textvariable=self.pos_qty_var, width=5).grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
-        
-        ttk.Button(entry_frame, text="Tambah ke Keranjang", command=self.add_to_cart).grid(row=0, column=5, padx=5, pady=5)
-        
-        # Label kamera untuk POS scanning
-        self.pos_camera_label = ttk.Label(entry_frame)
-        self.pos_camera_label.grid(row=1, column=0, columnspan=6, padx=5, pady=5)
 
     def setup_cart_frame(self, parent_frame):
         cart_frame = ttk.LabelFrame(parent_frame, text="Keranjang Belanja")
@@ -477,76 +537,14 @@ class ProductInventorySystem:
         random_barcode = ''.join(random.choices(string.digits, k=13))
         self.barcode_var.set(random_barcode)
 
-    def toggle_camera(self):
-        if self.camera_active:
-            self.camera_active = False
-            if self.camera_thread and self.camera_thread.is_alive():
-                self.camera_thread.join(timeout=1.0)
-            self.camera_label.config(image='')
-        else:
-            self.camera_active = True
-            self.camera_thread = threading.Thread(
-                target=self.start_camera,
-                args=(self.camera_label, self.barcode_var, lambda: self.camera_active)
-            )
-            self.camera_thread.daemon = True
-            self.camera_thread.start()
+    def on_closing(self):
+        # Tutup koneksi database
+        if hasattr(self, 'conn'):
+            self.conn.close()
+        
+        # Hancurkan window utama
+        self.root.destroy()
 
-    def pos_scan_barcode(self):
-        if hasattr(self, 'pos_camera_active') and self.pos_camera_active:
-            self.pos_camera_active = False
-            if hasattr(self, 'pos_camera_thread') and self.pos_camera_thread and self.pos_camera_thread.is_alive():
-                self.pos_camera_thread.join(timeout=1.0)
-            self.pos_camera_label.config(image='')
-        else:
-            self.pos_camera_active = True
-            self.pos_camera_thread = threading.Thread(
-                target=self.start_camera,
-                args=(self.pos_camera_label, self.pos_barcode_var, lambda: self.pos_camera_active)
-            )
-            self.pos_camera_thread.daemon = True
-            self.pos_camera_thread.start()
-
-    def start_camera(self, label, barcode_var, active_check):
-        try:
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                messagebox.showerror("Error", "Tidak dapat mengakses kamera")
-                return
-            
-            while active_check():
-                ret, frame = cap.read()
-                if ret:
-                    # Decode barcodes
-                    barcodes = decode(frame)
-                    
-                    # Gambar persegi di sekitar barcode yang terdeteksi
-                    for barcode in barcodes:
-                        x, y, w, h = barcode.rect
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        
-                        # Ambil data barcode
-                        barcode_data = barcode.data.decode('utf-8')
-                        barcode_var.set(barcode_data)
-                        
-                        # Hentikan kamera setelah scan berhasil
-                        active_check = lambda: False
-                    
-                    # Konversi frame untuk ditampilkan
-                    cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-                    img = Image.fromarray(cv2image)
-                    imgtk = ImageTk.PhotoImage(image=img)
-                    label.imgtk = imgtk
-                    label.config(image=imgtk)
-                    label.update()
-                    
-                time.sleep(0.1)
-        except Exception as e:
-            messagebox.showerror("Error", f"Terjadi kesalahan saat menggunakan kamera: {str(e)}")
-        finally:
-            if 'cap' in locals():
-                cap.release()
-            label.config(image='')
     def add_product(self):
         try:
             if not all([self.barcode_var.get(), self.product_name_var.get(), 
@@ -844,7 +842,7 @@ class ProductInventorySystem:
 
     def update_totals(self):
         subtotal = sum(float(self.cart_tree.item(item)['values'][5]) for item in self.cart_tree.get_children())
-        tax = subtotal * 0.11  # PPN 11%
+        tax = subtotal * self.tax_rate  # PPN 11%
         total = subtotal + tax
         
         self.subtotal_label.config(text=f"Rp {subtotal:,.2f}")
@@ -859,7 +857,7 @@ class ProductInventorySystem:
         try:
             # Hitung total
             subtotal = sum(float(self.cart_tree.item(item)['values'][5]) for item in self.cart_tree.get_children())
-            tax = subtotal * 0.11
+            tax = subtotal * self.tax_rate
             total = subtotal + tax
             
             # Generate transaction ID
@@ -1066,25 +1064,6 @@ class ProductInventorySystem:
                 messagebox.showwarning("Peringatan Stok Rendah", message)
         except Exception as e:
             messagebox.showerror("Error", f"Gagal memeriksa stok: {str(e)}")
-
-    def on_closing(self):
-        # Hentikan kamera yang aktif
-        self.camera_active = False
-        if hasattr(self, 'pos_camera_active'):
-            self.pos_camera_active = False
-        
-        # Tunggu thread kamera selesai
-        if hasattr(self, 'camera_thread') and self.camera_thread and self.camera_thread.is_alive():
-            self.camera_thread.join(timeout=1.0)
-        if hasattr(self, 'pos_camera_thread') and self.pos_camera_thread and self.pos_camera_thread.is_alive():
-            self.pos_camera_thread.join(timeout=1.0)
-        
-        # Tutup koneksi database
-        if hasattr(self, 'conn'):
-            self.conn.close()
-        
-        # Hancurkan window utama
-        self.root.destroy()
 
 # Jalankan aplikasi
 if __name__ == "__main__":
